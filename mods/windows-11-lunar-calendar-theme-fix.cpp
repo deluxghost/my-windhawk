@@ -2,7 +2,7 @@
 // @id              windows-11-lunar-calendar-theme-fix
 // @name            Windows 11 Lunar Calendar Theme Fix
 // @description     Fix hard-to-read lunar holiday text when Windows and apps use different light/dark themes
-// @version         0.1.0
+// @version         0.1.1
 // @author          deluxghost
 // @github          https://github.com/deluxghost
 // @homepage        https://github.com/deluxghost/my-windhawk
@@ -43,6 +43,8 @@ light/dark setting, matching the calendar background.
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.h>
 
+#include <atomic>
+#include <mutex>
 #include <unordered_set>
 
 namespace {
@@ -65,6 +67,11 @@ using SetForegroundBrush_t = void (*)(void*, void*);
 using ShouldSystemUseDarkMode_t = bool (*)();
 
 HMODULE g_actionCenterModule = nullptr;
+std::atomic<bool> g_calendarHookAttempted = false;
+std::mutex g_calendarHookMutex;
+bool g_calendarHooksReady = false;
+bool g_unloading = false;
+decltype(&LoadLibraryExW) g_loadLibraryExWOriginal = nullptr;
 OnGregorianForegroundColorChanged_t
     g_onGregorianForegroundColorChangedOriginal = nullptr;
 IsLunarHoliday_t g_isLunarHoliday = nullptr;
@@ -253,6 +260,51 @@ bool HookCalendarSymbols(HMODULE module) {
     return WindhawkUtils::HookSymbols(module, hooks, ARRAYSIZE(hooks), &options);
 }
 
+bool InitializeCalendarHooks(HMODULE module) {
+    // Serialize late initialization with unloading. The atomic flag also keeps
+    // symbol resolution's own DLL loads from reentering this initialization.
+    std::lock_guard lock(g_calendarHookMutex);
+    if (g_unloading) {
+        return false;
+    }
+    if (g_calendarHookAttempted.exchange(true)) {
+        return g_calendarHooksReady;
+    }
+
+    // Retain an already loaded module without initiating DLL initialization.
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                            reinterpret_cast<LPCWSTR>(module),
+                            &g_actionCenterModule)) {
+        const DWORD error = GetLastError();
+        Wh_Log(L"Failed to retain the calendar module: error=%lu", error);
+        return false;
+    }
+
+    if (!HookCalendarSymbols(g_actionCenterModule)) {
+        Wh_Log(L"Failed to resolve the required lunar calendar symbols");
+        return false;
+    }
+    if (!Wh_ApplyHookOperations()) {
+        Wh_Log(L"Failed to apply the lunar calendar hooks");
+        return false;
+    }
+
+    g_calendarHooksReady = true;
+    Wh_Log(L"Lunar calendar hooks initialized");
+    return true;
+}
+
+HMODULE WINAPI LoadLibraryExWHook(LPCWSTR fileName, HANDLE file, DWORD flags) {
+    const HMODULE module = g_loadLibraryExWOriginal(fileName, file, flags);
+    const DWORD error = GetLastError();
+    if (module && !g_calendarHookAttempted &&
+        module == GetModuleHandleW(kActionCenterModuleName)) {
+        InitializeCalendarHooks(module);
+    }
+    SetLastError(error);
+    return module;
+}
+
 }  // namespace
 
 BOOL Wh_ModInit() {
@@ -264,29 +316,36 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    // The DLL is shipped beside ShellExperienceHost.exe. Retain a module
-    // reference until Windhawk removes the hooks, including early initialization
-    // before the notification calendar has loaded its implementation.
-    g_actionCenterModule = LoadLibraryExW(
-        kActionCenterModuleName, nullptr,
-        LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!g_actionCenterModule) {
+    // Let the shell load its calendar component at its normal startup point.
+    // Forcing the load here can fail before its dependencies are initialized.
+    // Kernel32 has a separate wrapper; WinRT can call KernelBase directly.
+    const HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
+    const auto loadLibraryExW = reinterpret_cast<decltype(&LoadLibraryExW)>(
+        GetProcAddress(kernelBase, "LoadLibraryExW"));
+    if (!loadLibraryExW) {
         const DWORD error = GetLastError();
-        Wh_Log(L"Failed to load %s: error=%lu", kActionCenterModuleName, error);
+        Wh_Log(L"Failed to find KernelBase!LoadLibraryExW: error=%lu", error);
         return FALSE;
     }
-
-    if (!HookCalendarSymbols(g_actionCenterModule)) {
-        Wh_Log(L"Failed to resolve the required lunar calendar symbols");
-        FreeLibrary(g_actionCenterModule);
-        g_actionCenterModule = nullptr;
+    if (!WindhawkUtils::SetFunctionHook(loadLibraryExW, LoadLibraryExWHook,
+                                       &g_loadLibraryExWOriginal)) {
+        Wh_Log(L"Failed to hook LoadLibraryExW");
         return FALSE;
     }
-
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
+    // Also cover a DLL loaded before the loader hook became active.
+    const HMODULE module = GetModuleHandleW(kActionCenterModuleName);
+    if (!module) {
+        Wh_Log(L"Waiting for the shell to load the calendar module");
+        return;
+    }
+    if (!InitializeCalendarHooks(module)) {
+        return;
+    }
+
     // Existing date models predate the hook and otherwise retain their old
     // foreground until the native calendar updates them.
     std::unordered_set<DWORD> refreshedThreads;
@@ -295,6 +354,11 @@ void Wh_ModAfterInit() {
         const DWORD error = GetLastError();
         Wh_Log(L"Failed to enumerate calendar windows: error=%lu", error);
     }
+}
+
+void Wh_ModBeforeUninit() {
+    std::lock_guard lock(g_calendarHookMutex);
+    g_unloading = true;
 }
 
 void Wh_ModUninit() {
